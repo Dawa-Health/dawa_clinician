@@ -133,6 +133,7 @@ flutter:
     - assets/pdfs/
     - assets/jsons/
     - assets/Video_Not_a_GIF.mp4
+    - assets/images/sweep_steps/
 
 
 
