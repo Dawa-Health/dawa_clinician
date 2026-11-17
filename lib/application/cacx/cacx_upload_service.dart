@@ -2,41 +2,46 @@ import 'dart:async';
 import 'dart:convert';
 
 import '/backend/supabase/supabase_config.dart';
+import '/services/edge_device/edge_device_client.dart';
+import '/services/edge_device/edge_device_config.dart';
+import '/services/edge_device/edge_device_exceptions.dart';
+import '/services/edge_device/edge_device_manager.dart';
+import '/services/edge_device/edge_device_models.dart';
+import 'package:uuid/uuid.dart';
 import 'cacx_model.dart';
 import 'package:flutter/foundation.dart';
-import 'package:http/http.dart' as http;
-import 'package:http_parser/http_parser.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 class CervicalDeviceConfig {
   const CervicalDeviceConfig._();
 
-  static const _deviceSpecificBaseUrl = String.fromEnvironment(
-    'CERVICAL_DEVICE_BASE_URL',
-    defaultValue: '',
-  );
-
   static String get deviceBaseUrl {
-    final cervicalUrl = _deviceSpecificBaseUrl.trim();
-    return cervicalUrl.isNotEmpty ? cervicalUrl : PiDeviceConfig.baseUrl;
+    return EdgeDeviceConfig.fromEnvironment().baseUrl;
   }
 
   static String get normalizedDeviceBaseUrl =>
       deviceBaseUrl.replaceFirst(RegExp(r'/+$'), '');
 
-  static String get healthUrl => '$normalizedDeviceBaseUrl/health';
+  static String get healthUrl {
+    final config = EdgeDeviceConfig.fromEnvironment();
+    return config.endpoint(config.healthPath).toString();
+  }
 
-  static String get imagePostUrl => '$normalizedDeviceBaseUrl/upload/cervical';
+  static String get imagePostUrl {
+    final config = EdgeDeviceConfig.fromEnvironment();
+    if (config.modelManagementEnabled) {
+      return config.inferenceEndpoint(EdgeAIModel.cervicalCancer).toString();
+    }
+    return config.endpoint(config.cervicalUploadPath).toString();
+  }
 
-  static const timeoutSeconds = int.fromEnvironment(
-    'CERVICAL_IMAGE_TIMEOUT_SECONDS',
-    defaultValue: 120,
-  );
+  static int get timeoutSeconds {
+    return const int.fromEnvironment('CERVICAL_EDGE_TIMEOUT_SECONDS',
+        defaultValue: 60);
+  }
 
-  static const healthTimeoutSeconds = int.fromEnvironment(
-    'CERVICAL_HEALTH_TIMEOUT_SECONDS',
-    defaultValue: 5,
-  );
+  static int get healthTimeoutSeconds =>
+      EdgeDeviceConfig.fromEnvironment().requestTimeout.inSeconds;
 
   static const retryIntervalSeconds = int.fromEnvironment(
     'CERVICAL_DEVICE_RETRY_INTERVAL_SECONDS',
@@ -47,17 +52,12 @@ class CervicalDeviceConfig {
 class PiDeviceConfig {
   const PiDeviceConfig._();
 
-  static const _baseUrl = String.fromEnvironment(
-    'PI_DEVICE_BASE_URL',
-    defaultValue: 'http://DAWA.local:8084',
-  );
-
-  static String get baseUrl => _baseUrl.trim();
+  static String get baseUrl => EdgeDeviceConfig.fromEnvironment().baseUrl;
 
   static String get normalizedBaseUrl =>
       baseUrl.replaceFirst(RegExp(r'/+$'), '');
 
-  static String get healthUrl => '$normalizedBaseUrl/health';
+  static String get healthUrl => CervicalDeviceConfig.healthUrl;
 
   static String uploadUrlFor(String examinationType) {
     final cleanType = examinationType
@@ -67,7 +67,8 @@ class PiDeviceConfig {
         .replaceAll(RegExp(r'-+'), '-')
         .replaceAll(RegExp(r'^-|-$'), '');
 
-    return '$normalizedBaseUrl/upload/$cleanType';
+    final config = EdgeDeviceConfig.fromEnvironment();
+    return config.endpoint('/upload/$cleanType').toString();
   }
 }
 
@@ -182,11 +183,28 @@ class CervicalDeviceInterpretation {
   bool get requiresSecondOpinion =>
       failed || CacxRiskMapper.requiresSecondOpinion(label);
 
+  CervicalDeviceInterpretation withError(String message) {
+    return CervicalDeviceInterpretation(
+      label: label,
+      confidence: confidence,
+      rawResponse: rawResponse,
+      riskLevel: riskLevel,
+      deviceStatus: 'failed',
+      deviceEndpoint: deviceEndpoint,
+      error: message,
+    );
+  }
+
   AnalysisResult toAnalysisResult(String imageUrl) {
     final suspicion = CacxRiskMapper.suspicionForRisk(riskLevel);
-    final recommendation = failed
-        ? 'The device did not return a usable interpretation. Route this case for second opinion or repeat the device upload.'
-        : 'Primary device AI interpretation: $label. Device completed the diagnosis pathway.';
+    final returnedRecommendation =
+        rawResponse['recommendation'] ?? rawResponse['clinical_recommendation'];
+    final recommendation = returnedRecommendation is String &&
+            returnedRecommendation.trim().isNotEmpty
+        ? returnedRecommendation.trim()
+        : failed
+            ? 'The device did not return a usable screening interpretation.'
+            : 'The device classified this image as $label with ${confidence.toStringAsFixed(1)}% model confidence. This is an AI screening result and requires clinician review alongside the patient history and examination.';
 
     return AnalysisResult(
       imageUrl: imageUrl,
@@ -195,6 +213,15 @@ class CervicalDeviceInterpretation {
       suspicionLevel: suspicion,
       recommendation: recommendation,
       rawOutput: rawResponse,
+      predictionBreakdown: extractPredictionBreakdown({
+        for (final key in [
+          'probabilities',
+          'class_probabilities',
+          'confidences',
+          'scores'
+        ])
+          if (rawResponse[key] != null) key: rawResponse[key],
+      }),
       error: error,
     );
   }
@@ -203,64 +230,238 @@ class CervicalDeviceInterpretation {
 class CervicalDeviceService {
   const CervicalDeviceService._();
 
+  static EdgeDeviceManager get _deviceManager => EdgeDeviceManager.shared;
+  static EdgeDeviceClient get _deviceClient => _deviceManager.client;
+
   static Future<CervicalDeviceInterpretation> analyzeImage(
     String base64Image,
     String? patientId, {
     Duration? timeout,
+    @visibleForTesting EdgeDeviceManager? deviceManager,
   }) async {
-    return _sendImage(base64Image, patientId).timeout(
-      timeout ?? const Duration(seconds: CervicalDeviceConfig.timeoutSeconds),
-    );
+    final budget =
+        timeout ?? Duration(seconds: CervicalDeviceConfig.timeoutSeconds);
+    final abort = Completer<void>();
+    return _sendImage(base64Image, patientId,
+            deviceManager: deviceManager,
+            budget: budget,
+            abortTrigger: abort.future)
+        .timeout(budget, onTimeout: () {
+      if (!abort.isCompleted) abort.complete();
+      throw TimeoutException('The cervical device response deadline expired.');
+    });
   }
 
   static Future<void> checkHealth() async {
-    final response = await http
-        .get(Uri.parse(CervicalDeviceConfig.healthUrl))
-        .timeout(
-          const Duration(seconds: CervicalDeviceConfig.healthTimeoutSeconds),
-        );
-    if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw CervicalDeviceHttpException(response.statusCode, response.body);
+    try {
+      await _deviceClient.checkHealth();
+    } on EdgeDeviceException catch (error) {
+      if (error.failure == EdgeDeviceFailure.timeout) {
+        throw TimeoutException(error.message);
+      }
+      if (error.statusCode != null) {
+        throw CervicalDeviceHttpException(error.statusCode!, error.message);
+      }
+      rethrow;
     }
   }
 
   static Future<CervicalDeviceInterpretation> _sendImage(
     String base64Image,
-    String? patientId,
-  ) async {
+    String? patientId, {
+    EdgeDeviceManager? deviceManager,
+    required Duration budget,
+    required Future<void> abortTrigger,
+  }) async {
+    final deadline = DateTime.now().add(budget);
+    Duration remaining() {
+      final value = deadline.difference(DateTime.now());
+      if (value <= Duration.zero)
+        throw TimeoutException(
+            'The cervical device response deadline expired.');
+      return value;
+    }
+
+    final manager = deviceManager ?? _deviceManager;
+    final client = manager.client;
     final decoded = _decodeBase64Image(base64Image);
-    final request = http.MultipartRequest(
-      'POST',
-      Uri.parse(CervicalDeviceConfig.imagePostUrl),
-    )
-      ..fields['patient_id'] = patientId?.trim().isNotEmpty == true
-          ? patientId!.trim()
-          : 'unassigned'
-      ..fields['examination_type'] = 'cervical'
-      ..files.add(
-        http.MultipartFile.fromBytes(
-          'image',
-          decoded.bytes,
-          filename: 'cervical.${decoded.extension}',
-          contentType: MediaType.parse(decoded.mimeType),
-        ),
+    final normalizedPatientId = patientId?.trim();
+    final examinationId = const Uuid().v4();
+    var modelSessionReady = false;
+    try {
+      if (manager.modelManagementEnabled) {
+        await manager.beginExamination(
+          model: EdgeAIModel.cervicalCancer,
+          examinationId: examinationId,
+        );
+        remaining();
+        await manager.markExamining(examinationId);
+        remaining();
+        modelSessionReady = true;
+      }
+
+      if (modelSessionReady) {
+        CervicalDeviceInterpretation? completed;
+        try {
+          if (kDebugMode) {
+            debugPrint('[Device] Sending cervical image to '
+                '${client.config.inferenceEndpoint(EdgeAIModel.cervicalCancer)}');
+          }
+          final response = await client.predictCervical(
+            timeout: remaining(),
+            abortTrigger: abortTrigger,
+            imageBytes: decoded.bytes,
+            filename: 'cervical.${decoded.extension}',
+            mimeType: decoded.mimeType,
+          );
+          if (kDebugMode) {
+            debugPrint(
+                '[Device] Cervical inference response: HTTP ${response.statusCode}');
+          }
+          completed = _parseCervitriageResponse(
+            response.statusCode,
+            response.body,
+            deviceEndpoint: client.config
+                .inferenceEndpoint(EdgeAIModel.cervicalCancer)
+                .toString(),
+          );
+          return completed;
+        } finally {
+          try {
+            await manager.completeExamination(examinationId);
+          } catch (error, stack) {
+            // A completed inference must not be sent to a second provider just
+            // because lock release failed. The manager retains the uncertain
+            // session for its existing reconciliation flow.
+            if (completed == null) rethrow;
+            debugPrint(
+                '[CaCx] Result received; device session release failed: ${error.runtimeType}');
+            debugPrintStack(stackTrace: stack);
+          }
+        }
+      }
+
+      final response = await client.uploadCervicalImage(
+        timeout: remaining(),
+        abortTrigger: abortTrigger,
+        imageBytes: decoded.bytes,
+        filename: 'cervical.${decoded.extension}',
+        mimeType: decoded.mimeType,
+        patientId: normalizedPatientId?.isNotEmpty == true
+            ? normalizedPatientId!
+            : 'unassigned',
+      );
+      return _parseDeviceResponse(
+        response.body,
+        deviceEndpoint: client.config
+            .endpoint(
+              client.config.cervicalUploadPath,
+            )
+            .toString(),
+      );
+    } on EdgeDeviceException catch (error) {
+      if (error.failure == EdgeDeviceFailure.timeout) {
+        throw TimeoutException(error.message);
+      }
+      if (error.statusCode != null) {
+        throw CervicalDeviceHttpException(error.statusCode!, error.message);
+      }
+      rethrow;
+    }
+  }
+
+  /// Parses cervitriage `POST /predict`: `classification`, `confidence`
+  /// (0-1), `probabilities`, `gatekeeper_flagged`, `message`, `timings_ms`,
+  /// `record_id`. HTTP 422 is a gatekeeper rejection, not a connection failure.
+  @visibleForTesting
+  static CervicalDeviceInterpretation parseCervitriageResponse(
+    int statusCode,
+    String body, {
+    required String deviceEndpoint,
+  }) =>
+      _parseCervitriageResponse(
+        statusCode,
+        body,
+        deviceEndpoint: deviceEndpoint,
       );
 
-    final streamedResponse = await request.send();
-    final responseBody = await streamedResponse.stream.bytesToString();
-
-    if (streamedResponse.statusCode < 200 ||
-        streamedResponse.statusCode >= 300) {
-      throw CervicalDeviceHttpException(
-        streamedResponse.statusCode,
-        responseBody,
+  static CervicalDeviceInterpretation _parseCervitriageResponse(
+    int statusCode,
+    String body, {
+    required String deviceEndpoint,
+  }) {
+    Map<String, dynamic> raw;
+    try {
+      final decoded = jsonDecode(body);
+      if (decoded is! Map<String, dynamic>) throw const FormatException();
+      raw = decoded;
+    } on FormatException {
+      return CervicalDeviceInterpretation.failure(
+        label: 'Error',
+        message: 'The device returned an invalid prediction response.',
+        rawResponse: {'text': body},
+        deviceStatus: 'failed',
+        deviceEndpoint: deviceEndpoint,
       );
     }
 
-    return _parseDeviceResponse(responseBody);
+    if (statusCode == 422 || raw['gatekeeper_flagged'] == true) {
+      final message = raw['message'];
+      return CervicalDeviceInterpretation.failure(
+        label: 'Image rejected',
+        message: message is String && message.trim().isNotEmpty
+            ? message
+            : 'The device rejected the image as not suitable for cervical screening.',
+        rawResponse: raw,
+        deviceStatus: 'rejected',
+        deviceEndpoint: deviceEndpoint,
+      );
+    }
+
+    final classification = raw['classification'];
+    final confidence = raw['confidence'];
+    final gatekeeper = raw['gatekeeper_flagged'];
+    final probabilities = raw['probabilities'];
+    if (classification is! String ||
+        classification.trim().isEmpty ||
+        CacxRiskMapper.riskLevelFor(classification) == 'unknown' ||
+        (gatekeeper != null && gatekeeper is! bool) ||
+        (probabilities != null &&
+            (probabilities is! Map ||
+                probabilities.values.any((value) =>
+                    value is! num ||
+                    !value.isFinite ||
+                    value < 0 ||
+                    value > 1))) ||
+        confidence is! num ||
+        !confidence.isFinite ||
+        confidence < 0 ||
+        confidence > 1) {
+      return CervicalDeviceInterpretation.failure(
+        label: 'Error',
+        message:
+            'The device prediction did not include a valid classification and confidence.',
+        rawResponse: raw,
+        deviceStatus: 'failed',
+        deviceEndpoint: deviceEndpoint,
+      );
+    }
+
+    final label = classification.trim();
+    return CervicalDeviceInterpretation(
+      label: label,
+      confidence: double.parse((confidence * 100).toStringAsFixed(1)),
+      rawResponse: raw,
+      riskLevel: CacxRiskMapper.riskLevelFor(label),
+      deviceStatus: 'success',
+      deviceEndpoint: deviceEndpoint,
+    );
   }
 
-  static CervicalDeviceInterpretation _parseDeviceResponse(String body) {
+  static CervicalDeviceInterpretation _parseDeviceResponse(
+    String body, {
+    required String deviceEndpoint,
+  }) {
     dynamic decoded;
     try {
       decoded = jsonDecode(body);
@@ -288,18 +489,22 @@ class CervicalDeviceService {
             'status',
           })
         : 'Error';
-    final label = _cleanLabel(extractedLabel ?? body);
+    final label = _cleanLabel(
+      extractedLabel ?? (decoded is String ? decoded : ''),
+    );
     final confidence = _findConfidence(decoded);
     final riskLevel = CacxRiskMapper.riskLevelFor(label);
+    final hasResult = label.isNotEmpty && label != 'Unknown';
 
     return CervicalDeviceInterpretation(
-      label: label.isEmpty ? 'Unknown' : label,
+      label: hasResult ? label : 'Unknown',
       confidence: confidence,
       rawResponse: rawResponse,
-      riskLevel: riskLevel,
-      deviceStatus: errorText == null ? 'success' : 'failed',
-      deviceEndpoint: CervicalDeviceConfig.imagePostUrl,
-      error: errorText,
+      riskLevel: hasResult ? riskLevel : 'unknown',
+      deviceStatus: errorText == null && hasResult ? 'success' : 'failed',
+      deviceEndpoint: deviceEndpoint,
+      error: errorText ??
+          (hasResult ? null : 'The device response did not contain a result.'),
     );
   }
 
@@ -408,7 +613,26 @@ class CacxScreeningResultsRepository {
   const CacxScreeningResultsRepository._();
 
   static const table = 'cacx_screening_results';
+  static Future<void>? _queueOperation;
+  static Future<void> _serialize(Future<void> Function() action) {
+    final previous = _queueOperation;
+    final result = previous == null ? action() : previous.then((_) => action());
+    final settled =
+        result.then<void>((_) {}, onError: (Object _, StackTrace __) {});
+    _queueOperation = settled;
+    settled.then((_) {
+      if (identical(_queueOperation, settled)) _queueOperation = null;
+    });
+    return result;
+  }
+
   static const _pendingQueueKey = 'dawa_pending_cacx_screenings_v1';
+
+  /// The current database constraint has no separate rejection value. Retain
+  /// the rejection label and response, but persist it as a failed attempt.
+  @visibleForTesting
+  static String persistedDeviceStatus(CervicalDeviceInterpretation primary) =>
+      primary.deviceStatus == 'rejected' ? 'failed' : primary.deviceStatus;
 
   static String buildImagePath({
     required String? userId,
@@ -469,14 +693,15 @@ class CacxScreeningResultsRepository {
     );
   }
 
-  static Future<void> updateSecondOpinion({
+  static Future<bool> updateSecondOpinion({
     required String? recordId,
     required AnalysisResult result,
     required String status,
   }) async {
-    if (recordId == null || recordId.isEmpty) return;
+    if (recordId == null || recordId.isEmpty) return false;
 
     final payload = <String, dynamic>{
+      'second_opinion_required': true,
       'second_opinion_status': status,
       'second_opinion_source': 'gradio_server',
       'second_opinion_result': result.label,
@@ -485,19 +710,27 @@ class CacxScreeningResultsRepository {
     };
 
     try {
-      await runSupabaseRequest(
-        () => supabaseClient.from(table).update(payload).eq('id', recordId),
+      final row = await runSupabaseRequest(
+        () => supabaseClient
+            .from(table)
+            .update(payload)
+            .eq('id', recordId)
+            .select('id')
+            .maybeSingle(),
       );
+      return row != null;
     } catch (error) {
-      debugPrint('[CaCx Supabase] second opinion save failed: $error');
+      debugPrint(
+          '[CaCx Supabase] Second-opinion save failed (${error.runtimeType}).');
+      return false;
     }
   }
 
-  static Future<void> updatePrimaryResult({
+  static Future<bool> updatePrimaryResult({
     required String? recordId,
     required CervicalDeviceInterpretation primary,
   }) async {
-    if (recordId == null || recordId.isEmpty) return;
+    if (recordId == null || recordId.isEmpty) return false;
 
     final payload = <String, dynamic>{
       'primary_source': 'arduino_device',
@@ -506,16 +739,23 @@ class CacxScreeningResultsRepository {
       'primary_raw_response': primary.rawResponse,
       'risk_level': primary.riskLevel,
       'device_endpoint': primary.deviceEndpoint,
-      'device_status': primary.deviceStatus,
+      'device_status': persistedDeviceStatus(primary),
       'device_error': primary.error,
     };
 
     try {
-      await runSupabaseRequest(
-        () => supabaseClient.from(table).update(payload).eq('id', recordId),
+      final response = await runSupabaseRequest(
+        () => supabaseClient
+            .from(table)
+            .update(payload)
+            .eq('id', recordId)
+            .select('id')
+            .maybeSingle(),
       );
+      return response != null;
     } catch (error) {
       debugPrint('[CaCx Supabase] primary update failed: $error');
+      return false;
     }
   }
 
@@ -543,15 +783,22 @@ class CacxScreeningResultsRepository {
       'primary_raw_response': primary.rawResponse,
       'second_opinion_required': secondOpinionRequired,
       'second_opinion_status': secondOpinionStatus,
-      'second_opinion_source': secondOpinionRequired ? 'gradio_server' : null,
+      'second_opinion_source': null,
       'risk_level': primary.riskLevel,
       'device_endpoint': primary.deviceEndpoint,
-      'device_status': primary.deviceStatus,
+      'device_status': persistedDeviceStatus(primary),
       'device_error': primary.error,
     };
   }
 
-  static Future<void> syncPending() async {
+  static Future<void> syncPending(
+          {String? userId,
+          Future<void> Function(Map<String, dynamic>)? upload}) =>
+      _serialize(() => _syncPending(userId: userId, upload: upload));
+
+  static Future<void> _syncPending(
+      {String? userId,
+      Future<void> Function(Map<String, dynamic>)? upload}) async {
     final pending = await _readPending();
     if (pending.isEmpty) {
       return;
@@ -561,13 +808,30 @@ class CacxScreeningResultsRepository {
     for (final item in pending) {
       final payload = _mapValue(item['payload']);
       if (payload == null) {
+        remaining.add(item);
+        continue;
+      }
+      final uid = userId ?? supabaseClient.auth.currentUser?.id;
+      if (uid == null || payload['user_id'] != uid) {
+        remaining.add(item);
         continue;
       }
       try {
-        await runSupabaseRequest(
-          () =>
-              supabaseClient.from(table).insert(payload).select('id').single(),
-        );
+        // Older queued entries also receive a persistent retry identifier.
+        if (payload['id'] == null) {
+          payload['id'] = const Uuid().v4();
+          item['payload'] = payload;
+          await _writePending(pending);
+        }
+        if (upload != null) {
+          await upload(payload);
+        } else {
+          await runSupabaseRequest(() => supabaseClient
+              .from(table)
+              .upsert(payload, onConflict: 'id')
+              .select('id')
+              .single());
+        }
       } catch (error) {
         debugPrint('[CaCx Supabase] pending sync failed: $error');
         remaining.add(item);
@@ -576,19 +840,30 @@ class CacxScreeningResultsRepository {
     await _writePending(remaining);
   }
 
+  static Future<List<Map<String, dynamic>>> pendingRows(String uid) async =>
+      (await _readPending())
+          .map((r) => _mapValue(r['payload']))
+          .whereType<Map<String, dynamic>>()
+          .where((r) => r['user_id'] == uid)
+          .toList();
+
   static Future<int> pendingCount() async => (await _readPending()).length;
 
   static Future<void> _enqueuePendingInsert(
     Map<String, dynamic> payload,
-  ) async {
-    final pending = await _readPending();
-    pending.add({
-      'type': 'insert_primary',
-      'queued_at': DateTime.now().toUtc().toIso8601String(),
-      'payload': payload,
-    });
-    await _writePending(pending);
-  }
+  ) =>
+      _serialize(() async {
+        final pending = await _readPending();
+        payload.putIfAbsent('id', () => const Uuid().v4());
+        payload.putIfAbsent(
+            'created_at', () => DateTime.now().toUtc().toIso8601String());
+        pending.add({
+          'type': 'insert_primary',
+          'queued_at': DateTime.now().toUtc().toIso8601String(),
+          'payload': payload,
+        });
+        await _writePending(pending);
+      });
 
   static Future<List<Map<String, dynamic>>> _readPending() async {
     final prefs = await SharedPreferences.getInstance();
@@ -617,7 +892,9 @@ class CacxScreeningResultsRepository {
     List<Map<String, dynamic>> pending,
   ) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_pendingQueueKey, jsonEncode(pending));
+    if (!await prefs.setString(_pendingQueueKey, jsonEncode(pending))) {
+      throw StateError('Could not save screening results locally.');
+    }
   }
 
   static Map<String, dynamic>? _mapValue(dynamic value) {

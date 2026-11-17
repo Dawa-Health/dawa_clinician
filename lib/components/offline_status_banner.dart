@@ -1,3 +1,9 @@
+import '/services/screening_patient_repository.dart';
+import '/services/clinical_offline_store.dart';
+import '/application/hemonix/repository/anemia_repository.dart';
+import '/application/ultrasound/repositories/ultrasound_repository.dart';
+import '/application/cacx/cacx_upload_service.dart';
+import '/application/cacx/cacx_scan_drafts.dart';
 import 'dart:async';
 
 import 'package:flutter/material.dart';
@@ -20,6 +26,8 @@ class OfflineStatusScope extends StatefulWidget {
 class _OfflineStatusScopeState extends State<OfflineStatusScope> {
   Timer? _timer;
   String? _dismissedStatusKey;
+  String? _warmedUser;
+  bool _warming = false;
 
   @override
   void initState() {
@@ -36,11 +44,56 @@ class _OfflineStatusScopeState extends State<OfflineStatusScope> {
 
   Future<void> _refresh() async {
     final snapshot = await OfflineConnectivityService.refreshStatus();
+    if (snapshot.supabaseReachable) {
+      unawaited(_syncScanDrafts());
+      unawaited(_warmClinicalCache());
+    }
+    if (snapshot.isOffline) _warmedUser = null;
     if (!mounted) {
       return;
     }
     if (!snapshot.isOffline && _dismissedStatusKey != null) {
       setState(() => _dismissedStatusKey = null);
+    }
+  }
+
+  Future<void> _warmClinicalCache() async {
+    if (_warming) return;
+    try {
+      final uid = ClinicalOfflineStore.userId;
+      if (uid.isEmpty || uid == _warmedUser) return;
+      _warming = true;
+      final results = await Future.wait([
+        _warm(() => const SupabaseScreeningPatientRepository().loadPatients()),
+        _warm(() => const SupabaseAnemiaRepository().loadPatients()),
+        _warm(() => const SupabaseAnemiaRepository().loadRecords()),
+        _warm(() => const SupabaseUltrasoundRepository().loadPatients()),
+        _warm(() => const SupabaseUltrasoundRepository().loadScanRecords()),
+      ]);
+      if (results.every((ok) => ok)) _warmedUser = uid;
+    } catch (_) {
+      // Startup may precede auth initialization; retry next connection check.
+    } finally {
+      _warming = false;
+    }
+  }
+
+  Future<bool> _warm(Future<Object?> Function() load) async {
+    try {
+      await load();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> _syncScanDrafts() async {
+    try {
+      await ClinicalOfflineStore.sync();
+      await CacxScreeningResultsRepository.syncPending();
+      await CacxScanDrafts.sync();
+    } catch (_) {
+      // Auth may not yet be initialized. The next connection check retries.
     }
   }
 
@@ -133,17 +186,21 @@ class _OfflineBanner extends StatelessWidget {
             ),
           ),
           const SizedBox(width: 8),
-          IconButton(
-            tooltip: 'Dismiss offline status',
-            onPressed: onDismiss,
-            icon: const Icon(
-              Icons.close_rounded,
-              size: 18,
-              color: DawaTokens.statusWarningText,
+          // This banner sits above the Navigator, outside its Overlay.
+          // Label the button without creating an Overlay-dependent Tooltip.
+          Semantics(
+            label: 'Dismiss offline status',
+            child: IconButton(
+              onPressed: onDismiss,
+              icon: const Icon(
+                Icons.close_rounded,
+                size: 18,
+                color: DawaTokens.statusWarningText,
+              ),
+              padding: EdgeInsets.zero,
+              visualDensity: VisualDensity.compact,
+              constraints: const BoxConstraints.tightFor(width: 32, height: 32),
             ),
-            padding: EdgeInsets.zero,
-            visualDensity: VisualDensity.compact,
-            constraints: const BoxConstraints.tightFor(width: 32, height: 32),
           ),
         ],
       ),
