@@ -56,8 +56,8 @@ Current maintainers and reviewers:
 
 | Name | Role | Area |
 | --- | --- | --- |
-| _To be confirmed_ | Maintainer | Repository and releases |
-| _To be confirmed_ | Clinical reviewer | Screening tools and clinical content |
+| Tariro F Munzwa | Maintainer | Repository and releases |
+| Tafadzwa K Munzwa, MD | Clinical reviewer | Screening tools and clinical content |
 
 ## 6. Decision making
 
