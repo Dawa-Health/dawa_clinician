@@ -17,6 +17,8 @@ import 'flutter_flow/flutter_flow_util.dart';
 
 // IMPORT THE NEW SPLASH SCREEN
 import 'dawa_splash_screen.dart';
+import '/features/terms/clinician_terms_consent.dart';
+import '/features/terms/clinician_terms_page.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -60,6 +62,15 @@ class _MyAppState extends State<MyApp> {
   // Track the custom splash state
   bool _showCustomSplash = true;
 
+  // Terms and conditions: after the splash they cover the app until the
+  // current version has been accepted on this device. Null while the saved
+  // agreement is still being read (the splash stays up until then).
+  ClinicianTermsConsent? _termsConsent;
+  bool _termsAcceptedNow = false;
+
+  bool get _termsPending =>
+      !_termsAcceptedNow && !(_termsConsent?.hasAcceptedCurrentTerms ?? false);
+
   String getRoute([RouteMatch? routeMatch]) {
     final RouteMatch lastMatch =
         routeMatch ?? _router.routerDelegate.currentConfiguration.last;
@@ -89,6 +100,12 @@ class _MyAppState extends State<MyApp> {
       });
     jwtTokenStream.listen((_) {});
 
+    // Read while the splash plays, so the terms are ready (or skipped) when
+    // it ends.
+    ClinicianTermsConsent.load().then((consent) {
+      if (mounted) setState(() => _termsConsent = consent);
+    });
+
     // OLD SPLASH LOGIC REMOVED
     // Future.delayed(
     //   Duration(milliseconds: 1000),
@@ -109,6 +126,17 @@ class _MyAppState extends State<MyApp> {
     });
     // Notify FlutterFlow logic that splash is done (preserves original logic)
     _appStateNotifier.stopShowingSplashImage();
+  }
+
+  Future<void> _acceptTerms() async {
+    final consent = _termsConsent ?? await ClinicianTermsConsent.load();
+    await consent.accept();
+    if (mounted) {
+      setState(() {
+        _termsConsent = consent;
+        _termsAcceptedNow = true;
+      });
+    }
   }
 
   @override
@@ -263,18 +291,36 @@ class _MyAppState extends State<MyApp> {
         return OfflineStatusScope(
           child: Stack(
             children: [
-              // The actual App Router
-              Router(
-                routerDelegate: _router.routerDelegate,
-                routeInformationParser: _router.routeInformationParser,
-                routeInformationProvider: _router.routeInformationProvider,
+              // The actual App Router. Until the terms are accepted it cannot
+              // be touched, focused with a keyboard, or read by a screen
+              // reader, so nothing behind the terms screen can be used.
+              ExcludeFocus(
+                excluding: _termsPending,
+                child: ExcludeSemantics(
+                  excluding: _termsPending,
+                  child: IgnorePointer(
+                    ignoring: _termsPending,
+                    child: Router(
+                      routerDelegate: _router.routerDelegate,
+                      routeInformationParser: _router.routeInformationParser,
+                      routeInformationProvider:
+                          _router.routeInformationProvider,
+                    ),
+                  ),
+                ),
               ),
-              // The Custom Splash Screen Overlay
-              if (_showCustomSplash)
+              // The Custom Splash Screen Overlay. It also stays up while the
+              // saved terms agreement is read, so the terms never flash.
+              if (_showCustomSplash || _termsConsent == null)
                 Positioned.fill(
                   child: DawaSplashScreen(
                     onAnimationComplete: _onSplashComplete,
                   ),
+                )
+              // The terms, until the current version has been accepted.
+              else if (_termsPending)
+                Positioned.fill(
+                  child: ClinicianTermsPage.agreement(onAgree: _acceptTerms),
                 ),
             ],
           ),

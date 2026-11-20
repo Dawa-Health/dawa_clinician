@@ -44,6 +44,32 @@ void main() {
     expect(find.textContaining('Sample Patient'), findsNothing);
   });
 
+  testWidgets('opens straight to the dashboard without a splash screen',
+      (tester) async {
+    tester.view.physicalSize = const Size(390, 844);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: UltrasoundApp(
+            repository: _EmptyUltrasoundRepository(),
+            edgeDeviceManager: EdgeDeviceManager(
+                client: EdgeDeviceClient(
+                    config: const EdgeDeviceConfig(
+                        baseUrl: 'http://localhost',
+                        modelManagementEnabled: false)))),
+      ),
+    );
+
+    // The very first frame is the workspace, not a branded loading screen.
+    expect(find.text('Dawa Ultrasound'), findsNothing);
+    expect(find.text('AI-Guided Obstetric Scanning'), findsNothing);
+    expect(find.text('Patient Records'), findsWidgets);
+    await tester.pumpAndSettle();
+  });
+
   testWidgets(
       'opening the workflow selects Ultrasound before patient selection',
       (tester) async {

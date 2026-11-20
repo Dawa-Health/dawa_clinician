@@ -53,7 +53,7 @@ class UltrasoundApp extends StatefulWidget {
 }
 
 class _UltrasoundAppState extends State<UltrasoundApp> {
-  UltrasoundAppState _appState = UltrasoundAppState.splash;
+  UltrasoundAppState _appState = UltrasoundAppState.dashboard;
   UltrasoundDashboardTab _activeTab = UltrasoundDashboardTab.home;
 
   List<PregnantPatient> _patients = [];
@@ -97,13 +97,6 @@ class _UltrasoundAppState extends State<UltrasoundApp> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted)
         unawaited(_edgeDeviceManager.prepareWorkflow(EdgeAIModel.ultrasound));
-    });
-
-    Future.delayed(const Duration(milliseconds: 500), () {
-      if (mounted) {
-        setState(() => _appState = UltrasoundAppState.dashboard);
-        _handleInitialLaunch();
-      }
     });
   }
 
@@ -207,6 +200,15 @@ class _UltrasoundAppState extends State<UltrasoundApp> {
         _dataError = error.toString();
         _isLoadingData = false;
       });
+    }
+    // Open the requested scan workflow as soon as the patient list is known,
+    // because starting a scan checks the patient against it. (This used to
+    // wait behind a half-second splash screen.) Runs once; later reloads are
+    // ignored by _handleInitialLaunch.
+    if (mounted) {
+      WidgetsBinding.instance.addPostFrameCallback(
+        (_) => _handleInitialLaunch(),
+      );
     }
   }
 
@@ -820,8 +822,6 @@ class _UltrasoundAppState extends State<UltrasoundApp> {
   @override
   Widget build(BuildContext context) {
     switch (_appState) {
-      case UltrasoundAppState.splash:
-        return _buildSplash();
       case UltrasoundAppState.manualScan:
         return _buildManualScanWorkspace();
       case UltrasoundAppState.aiGuidedScan:
@@ -831,62 +831,6 @@ class _UltrasoundAppState extends State<UltrasoundApp> {
       default:
         return _buildMainLayout();
     }
-  }
-
-  // ─── SPLASH ───────────────────────────────────────────────────────────────
-
-  Widget _buildSplash() {
-    return Scaffold(
-      backgroundColor: DawaTokens.brandPrimary,
-      body: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            TweenAnimationBuilder<double>(
-              duration: const Duration(seconds: 2),
-              tween: Tween(begin: 0, end: 1),
-              builder: (context, value, child) =>
-                  Transform.scale(scale: 0.8 + value * 0.2, child: child),
-              child: Container(
-                width: 120,
-                height: 120,
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(24),
-                ),
-                child: Padding(
-                  padding: const EdgeInsets.all(16),
-                  child: Image.asset(
-                    'assets/images/dawa_cross.png',
-                    fit: BoxFit.contain,
-                  ),
-                ),
-              ),
-            ),
-            const SizedBox(height: 32),
-            const Text(
-              'Dawa Ultrasound',
-              style: TextStyle(
-                color: Colors.white,
-                fontSize: 32,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-            const SizedBox(height: 8),
-            const Text(
-              'AI-Guided Obstetric Scanning',
-              style: TextStyle(
-                color: Colors.white60,
-                fontSize: 16,
-                letterSpacing: 1.5,
-              ),
-            ),
-            const SizedBox(height: 64),
-            const CircularProgressIndicator(color: Colors.white),
-          ],
-        ),
-      ),
-    );
   }
 
   // ─── MAIN LAYOUT ──────────────────────────────────────────────────────────

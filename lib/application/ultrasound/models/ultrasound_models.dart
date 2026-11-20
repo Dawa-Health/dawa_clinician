@@ -5,7 +5,6 @@ import '/components/dawa_design_system.dart';
 // ─── APP STATE ───────────────────────────────────────────────────────────────
 
 enum UltrasoundAppState {
-  splash,
   dashboard,
   manualScan,
   aiGuidedScan,
