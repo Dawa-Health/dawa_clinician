@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '/auth/firebase_auth/auth_util.dart';
+import '/features/terms/clinician_terms_page.dart';
 import 'navigation_design_system.dart';
 
 class ClinicianAccountMenu extends StatelessWidget {
@@ -50,6 +51,11 @@ class ClinicianAccountMenu extends StatelessWidget {
                         ])),
             leadingIcon: const NavigationIcon(NavigationSymbol.info),
             child: const Text('Account information')),
+        MenuItemButton(
+            onPressed: () => Navigator.of(context).push(MaterialPageRoute<void>(
+                builder: (_) => const ClinicianTermsPage.view())),
+            leadingIcon: const NavigationIcon(NavigationSymbol.info),
+            child: const Text('Terms and conditions')),
         const Divider(height: 1, color: NavigationTokens.border),
         MenuItemButton(
             onPressed: onSignOut,
